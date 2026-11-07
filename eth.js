@@ -197,9 +197,14 @@
   }
 
   // ---------- JSON-RPC with failover ----------
-  // an endpoint that fails at the network level or rate-limits (429) is benched for 30 s
+  // an endpoint that fails at the network level, rate-limits (429) or never answers is benched for 30 s.
+  // RPC_TIMEOUT_MS: a stalling endpoint (connects but never responds, no error) must not hang the caller
+  // forever — fetch() with no abort signal waits indefinitely: one stuck endpoint fills the browser's
+  // 6-connections-per-origin limit, so every later request to it, including the one the click needs,
+  // queues behind it and never even starts.
   let rr = 0, rid = 0;
   const bench = new Map();
+  const RPC_TIMEOUT_MS = 10000;
   // opt.allowNull: a null result is an answer (pending receipt), not a failure
   async function rpc(method, params, rpcs, opt) {
     rpcs = rpcs || (root.CONFIG && root.CONFIG.RPCS) || ["https://eth-mainnet.public.blastapi.io"];
@@ -207,15 +212,20 @@
     for (let k = 0; k < 2 * rpcs.length; k++) {
       const now = Date.now(), up = rpcs.filter(u => !(bench.get(u) > now)), pool = up.length ? up : rpcs;
       const url = pool[(rr++) % pool.length];
+      const ac = new AbortController(), timer = setTimeout(() => ac.abort(), RPC_TIMEOUT_MS);
       try {
-        const r = await fetch(url, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ jsonrpc: "2.0", id: ++rid, method, params }) });
+        const r = await fetch(url, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ jsonrpc: "2.0", id: ++rid, method, params }), signal: ac.signal });
         if (r.status === 429) { bench.set(url, Date.now() + 30e3); last = "rate limited"; continue; }
         const j = await r.json();
         if (j.result !== undefined && (j.result !== null || (opt && opt.allowNull))) return j.result;
         // a revert is an answer, not a node failure: stop and keep the revert data
         if (j.error && (j.error.code === 3 || /revert/i.test(j.error.message || ""))) { const er = Error(j.error.message || "execution reverted"); er.data = j.error.data; er.revert = true; throw er; }
         last = j.error ? j.error.message : "null result";
-      } catch (e) { if (e.revert) throw e; last = e.message; if (e.name === "TypeError") bench.set(url, Date.now() + 30e3); }
+      } catch (e) {
+        if (e.revert) throw e;
+        last = e.name === "AbortError" ? "timed out after " + RPC_TIMEOUT_MS + "ms" : e.message;
+        if (e.name === "TypeError" || e.name === "AbortError") bench.set(url, Date.now() + 30e3);
+      } finally { clearTimeout(timer); }
     }
     throw Error(method + ": " + last);
   }

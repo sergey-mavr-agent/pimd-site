@@ -51,6 +51,7 @@
         });
       },
       boundary: () => null,                  // demo: strikes come from RPC only
+      balance: () => ({ usdc: 150, imd: 25, credit: 0 }),
       // writes: nothing is sent
       order: async () => { ctx.how(); return null; },
       cancel: sent, cancelAll: sent, split: sent, merge: sent, claim: sent, claimAll: sent,
@@ -124,7 +125,15 @@
     // all writes go through WALLET.sendTx (EIP-6963 or any added option); dry run first for a readable revert
     async function sendRaw(to, data) {
       if (!W.address) { ctx.connect(); throw Error("Connect a wallet first"); }
-      await rpc("eth_call", [{ from: W.address, to, data }, "latest"]).catch(e => { throw nice(e); });
+      // the dry-run eth_call before signing can take a while on a busy node; past 15s tell the user
+      // we're still checking instead of leaving a dead-looking button, past 45s give up with a clear error.
+      const slow = setTimeout(() => ctx.toast("Checking the order…"), 15000);
+      try {
+        await Promise.race([
+          rpc("eth_call", [{ from: W.address, to, data }, "latest"]).catch(e => { throw nice(e); }),
+          new Promise((_, rej) => setTimeout(() => rej(Error("The order check is taking too long. Try again in a minute.")), 45000)),
+        ]);
+      } finally { clearTimeout(slow); }
       const hash = await W.sendTx({ to, data });
       ctx.toast("Sent · waiting for confirmation…");
       await waitReceipt(hash); invalidate(); return hash;
@@ -166,11 +175,18 @@
       for (const Tms of [...new Set(list.filter(Boolean))]) {
         if (subs.length >= 2) break;
         if (Tms > Date.now() - 40e3 || Date.now() - Tms > 27 * 36e5) continue;   // not mined yet / proof window closed
-        const T = BigInt(Math.floor(Tms / 1e3)), [p] = await orc("price", [v, T]);
-        if (p > 0n) continue;
-        ctx.toast("Building the price proof…");
-        const pkg = await P.build(Number(T), { slots: await pathSlots(v) });
-        subs.push(P.encodeForContract(pkg, v)); price = pkg.price;
+        try {
+          const T = BigInt(Math.floor(Tms / 1e3)), [p] = await orc("price", [v, T]);
+          if (p > 0n) continue;
+          ctx.toast("Building the price proof…");
+          const pkg = await P.build(Number(T), { slots: await pathSlots(v) });
+          subs.push(P.encodeForContract(pkg, v)); price = pkg.price;
+        } catch (e) {
+          // One boundary failing to build (RPC hiccup, proof window edge) must not abort the others in
+          // this list: AUTO_PROOFS boundaries are an opportunistic side-effect of the order, not required
+          // for it — a failed proof here must not void the whole order or claim.
+          ctx.toast(`Price record for ${new Date(Tms).toISOString().slice(0, 16)} skipped: ${String(e.message || e).slice(0, 80)}`);
+        }
       }
       return { subs, price };
     }
@@ -208,7 +224,18 @@
           const logs = await rpc("eth_getLogs", [{ address: cfg.CONTRACT, fromBlock: "0x" + from.toString(16), toBlock: "0x" + to.toString(16) }]);
           for (const l of logs) { const d = E.decodeLog(AM, l); if (d) LOGS.list.push(d); }
           from = to + 1; LOGS.from = from;
-        } catch (e) { if (step <= 500) throw e; step = Math.floor(step / 4); }
+          step = Math.min(20000, step * 2); // rpc() already round-robins CONFIG.RPCS per call, so the
+          // provider that capped the last range may not be picked next time - grow step back up rather
+          // than crawl the rest of the index at the smallest width any one provider ever demanded
+        } catch (e) {
+          // some free RPCs cap eth_getLogs far below our 20000-block step (seen: blastapi "up to a 10
+          // block range" on this range) - their error names the exact width that will work, use it
+          // directly instead of /4-backoff bottoming out at 500 and giving up above their real cap
+          const m = /up to an? (\d+) block range/i.exec(e.message || "");
+          if (m) { step = Math.max(1, +m[1]); continue; }
+          if (step <= 1) throw e;
+          step = Math.max(1, Math.floor(step / 4));
+        }
       }
       LOGS.head = head; LOGS.headT = Date.now();
       return { n: LOGS.list.length, list: LOGS.list };
@@ -267,6 +294,16 @@
       const ix = index(); if (!ix) return { markets: 4, vol24: null, paid: null };
       const from = LOGS.head - 7200, live = ctx.live() || 0;
       return { markets: 4, vol24: ix.fills.filter(f => f.bn >= from).reduce((s, f) => s + f.q * f.x, 0), paid: ix.claims.reduce((s, c) => s + c.usdc + c.imd * live, 0) };
+    }
+
+    // ---- balance only: Deposit/Withdraw and the balance line must appear right after Connect without
+    // waiting for the full event index (syncLogs can take seconds); this is 2 eth_call + 1 oracle read.
+    function balanceOnly(addr) {
+      if (!ready() || !addr) return null;
+      return memo("bal:" + addr.toLowerCase(), 15e3, async () => {
+        const [bu] = await mkt("balance", [addr, cfg.USDC]), [bi] = await mkt("balance", [addr, cfg.IMD]), [cr] = await orc("credit", [addr]);
+        return { usdc: f6(bu), imd: f18(bi), credit: f18(cr) };
+      });
     }
 
     // ---- portfolio: balances, positions, open orders, claims, history
@@ -411,7 +448,7 @@
     const finalize = async Tms => sendOracle("finalize", [await version(), BigInt(Math.floor(Tms / 1e3))]);
     const withdrawCredit = () => sendOracle("withdrawCredit", []);
 
-    return { name: "chain", demo: false, ready, heroStats, volume, ladderVolume, book, portfolio, leaderboard, boundary,
+    return { name: "chain", demo: false, ready, heroStats, volume, ladderVolume, book, portfolio, balance: balanceOnly, leaderboard, boundary,
       order, cancel, cancelAll, split, merge, claim, claimAll, deposit, withdraw, proposePrice, dispute, finalize, withdrawCredit,
       _call: mkt, _events: events, _idOf: idOf, _feeBudget: feeBudget };
   }
